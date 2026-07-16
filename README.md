@@ -1,6 +1,17 @@
 # inteRx
 probabilistic drug-interaction, specifically, interpret if any combination of drugs prescribed poses risk?
 
+## app.py: marimo notebook script 
+
+hosted at [molab-wasm-page](https://molab.marimo.io/github//fuzzyLife/inteRx/blob/master/app.py/wasm), for serving locally try
+```
+uv run marimo run app.py 
+
+        Running app.py ⚡
+
+        ➜  URL: http://localhost:2718
+```         
+
 ## Inspiration
 reduce iatrogenic  issues
 ## What it does
