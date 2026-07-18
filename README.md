@@ -4,7 +4,7 @@ inteRx is a Marimo-based probabilistic drug-interaction explorer for research an
 
 Hosted as a [molab-wasm-page](https://molab.marimo.io/github//fuzzyLife/inteRx/blob/master/app.py/wasm).
 
-![inteRx interface](image.png)
+![inteRx interface](image.jpeg)
 
 > **Important:** inteRx is not a clinical decision-support tool. It must not be used to prescribe, stop, or change medication. A missing interaction result does not mean that a combination is safe.
 
