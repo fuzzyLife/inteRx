@@ -12621,234 +12621,458 @@ def _(anywidget, mo, openfda_drug_choices, traitlets):
 
 
 @app.cell(hide_code=True)
-def _(Path, combinations, drug_picker, mo, np, openfda_drug_choice_set, os, pd, quote, re, requests, run_check):
-    """Collect normalized evidence from openFDA plus optional local exports."""
-    mo.stop(not run_check.value, mo.md("Add drugs, then select **Run interaction check**."))
+def _(combinations, drug_picker, mo, np, openfda_drug_choice_set, pd, quote, re, requests, run_check):
+    """Retrieve openFDA labels and estimate documentation, not clinical risk."""
+    mo.stop(
+        not run_check.value,
+        mo.md("Add one or more drugs, then select **Run interaction check**."),
+    )
     selected_drugs = sorted({
-        str(drug).strip().casefold()
-        for drug in drug_picker.selected
-        if str(drug).strip().casefold() in openfda_drug_choice_set
+        str(_drug_name).strip().casefold()
+        for _drug_name in drug_picker.selected
+        if str(_drug_name).strip().casefold() in openfda_drug_choice_set
     })
-    mo.stop(len(selected_drugs) < 2, mo.md("Select at least two distinct drugs."))
-    evidence_path = Path(os.getenv("INTERACTION_EVIDENCE", "interaction_evidence.csv"))
-    columns = [
-        "drug_a", "drug_b", "harm", "source", "evidence_id",
-        "positive", "negative", "weight", "url",
-    ]
-    if evidence_path.exists():
-        evidence = pd.read_csv(evidence_path)
-        missing = set(columns) - set(evidence.columns)
-        if missing:
-            raise ValueError(f"Evidence file is missing columns: {sorted(missing)}")
-        evidence = evidence.copy()
-        for col in ["positive", "negative", "weight"]:
-            evidence[col] = pd.to_numeric(evidence[col], errors="raise")
-        evidence["source"] = evidence["source"].str.lower().str.strip()
-        evidence["drug_a"] = evidence["drug_a"].str.lower().str.strip()
-        evidence["drug_b"] = evidence["drug_b"].str.lower().str.strip()
-    else:
-        evidence = pd.DataFrame(columns=columns)
-
-    def check_openfda_interactions(drug_list):
-        """Turn explicit openFDA label mentions into evidence rows.
-
-        openFDA supplies label text, not pairwise clinical probabilities. A
-        missing drug name is deliberately not encoded as negative evidence.
-        """
-        base_url = "https://api.fda.gov/drug/label.json"
-        rows = []
-        errors = []
-
-        def label_url(query):
-            return f"{base_url}?search={quote(query, safe='')}&limit=1"
-
-        def interaction_excerpt(section, other):
-            """Return the label sentence that explicitly names the other drug."""
-            text = " ".join(section.split())
-            sentences = re.split(r"(?<=[.!?])\s+", text)
-            for sentence in sentences:
-                if re.search(rf"\b{re.escape(other)}\b", sentence, re.IGNORECASE):
-                    return sentence[:500].rstrip()
-            return None
-
-        seen = set()
-        for drug in drug_list:
-            try:
-                # `fields` is not a response-projection parameter for this
-                # endpoint. Use its documented `search` and `limit` options.
-                labels = []
-                for field in ("openfda.brand_name", "openfda.generic_name"):
-                    response = requests.get(
-                        base_url,
-                        params={"search": f'{field}:"{drug}"', "limit": 5},
-                        timeout=15,
-                    )
-                    if response.status_code == 404:
-                        continue
-                    response.raise_for_status()
-                    labels.extend(response.json().get("results", []))
-
-                if not labels:
-                    continue
-                for other in drug_list:
-                    if other == drug:
-                        continue
-                    for label in labels:
-                        evidence_ids = (
-                            label.get("openfda", {}).get("spl_id", [])
-                            or label.get("openfda", {}).get("application_number", [])
-                        )
-                        evidence_id = str(evidence_ids[0]) if evidence_ids else f"openfda:{drug}"
-                        source_url = label_url(
-                            f'openfda.spl_id:"{evidence_id}"'
-                            if evidence_ids
-                            else f'openfda.generic_name:"{drug}"'
-                        )
-                        for section in label.get("drug_interactions", []):
-                            harm = interaction_excerpt(section, other)
-                            if harm is None:
-                                continue
-                            row_key = (drug, other, evidence_id, harm)
-                            if row_key in seen:
-                                continue
-                            seen.add(row_key)
-                            rows.append({
-                                "drug_a": drug,
-                                "drug_b": other,
-                                "harm": harm,
-                                "source": "fda_label",
-                                "evidence_id": evidence_id,
-                                "positive": 1,
-                                "negative": 0,
-                                "weight": 1.0,
-                                "url": source_url,
-                            })
-            except requests.RequestException as exc:
-                status = exc.response.status_code if exc.response is not None else "connection failed"
-                errors.append(f"{drug}: openFDA HTTP {status}")
-            except ValueError:
-                errors.append(f"{drug}: invalid JSON response from openFDA")
-        return pd.DataFrame(rows, columns=columns), errors
-
-    fda_evidence, fda_errors = check_openfda_interactions(
-        selected_drugs
-    )
-    evidence = pd.concat([evidence, fda_evidence], ignore_index=True)
-
-    # Source weights are conservative defaults and should be calibrated against
-    # a reviewed validation set, not treated as clinical truth.
-    source_weights = {
-        "drugbank": 1.0,
-        "fda_label": 1.25,
-        "pubmed": 0.9,
-        "pharmacovigilance": 0.75,
-    }
-    evidence["source_weight"] = evidence["source"].map(source_weights).fillna(0.5)
-    evidence["effective_weight"] = evidence["weight"] * evidence["source_weight"]
-    evidence[["drug_a", "drug_b"]] = evidence[["drug_a", "drug_b"]].apply(
-        lambda row: sorted(row), axis=1, result_type="expand"
+    mo.stop(
+        not selected_drugs,
+        mo.md("Select at least one drug."),
     )
 
-    entered = selected_drugs
-    # `.loc` preserves the evidence schema when no rows are available; direct
-    # bracket indexing with an empty `apply` result can instead select columns.
-    matched = evidence.loc[
-        evidence["drug_a"].isin(entered) & evidence["drug_b"].isin(entered)
-    ].copy()
-
-    prior_alpha, prior_beta = 1.0, 9.0
+    _base_url = "https://api.fda.gov/drug/label.json"
+    _prior_alpha = 0.5
+    _prior_beta = 0.5
+    _posterior_draw_count = 20_000
     _rng = np.random.default_rng(42)
-    findings = []
-    for (drug_a, drug_b), group in matched.groupby(["drug_a", "drug_b"]):
-        alpha = prior_alpha + (group["positive"] * group["effective_weight"]).sum()
-        beta = prior_beta + (group["negative"] * group["effective_weight"]).sum()
-        samples = _rng.beta(alpha, beta, 20_000)
-        source_urls = sorted(set(group["url"].dropna().astype(str)))
-        harms = list(dict.fromkeys(group["harm"].dropna().astype(str)))
-        findings.append({
-            "drug_a": drug_a,
-            "drug_b": drug_b,
-            "harm": "\n\n".join(harms),
-            "posterior_probability": alpha / (alpha + beta),
-            "credible_low": np.quantile(samples, 0.025),
-            "credible_high": np.quantile(samples, 0.975),
-            "evidence_count": len(group),
-            "sources": ", ".join(sorted(group["source"].unique())),
-            "evidence_ids": ", ".join(group["evidence_id"].astype(str)),
-            "source_url": source_urls[0] if source_urls else "",
-        })
-    results = pd.DataFrame(
-        findings,
-        columns=[
-            "drug_a", "drug_b", "harm", "posterior_probability",
-            "credible_low", "credible_high", "evidence_count", "sources",
-            "evidence_ids", "source_url",
-        ],
-    )
 
-    candidate_pairs = pd.DataFrame(
-        combinations(entered, 2), columns=["drug_a", "drug_b"]
-    )
-    pair_results = candidate_pairs.merge(
-        results, on=["drug_a", "drug_b"], how="left"
-    )
-    pair_results["status"] = np.where(
-        pair_results["posterior_probability"].notna()
-        if "posterior_probability" in pair_results
-        else False,
-        "Explicit label evidence found",
-        "No explicit label co-mention found",
-    )
+    def _normalize_text(_value):
+        return " ".join(str(_value).casefold().split())
 
-    return evidence_path, entered, fda_errors, pair_results, results
+    def _label_family_id(_label, _selected_name, _position):
+        _openfda = _label.get("openfda", {})
+        _set_ids = _openfda.get("spl_set_id", [])
+        if isinstance(_set_ids, str):
+            _set_ids = [_set_ids]
+        if _set_ids:
+            return str(_set_ids[0])
 
+        _set_id = _label.get("set_id")
+        if _set_id:
+            return str(_set_id)
 
-@app.cell(hide_code=True)
-def _(entered, evidence_path, fda_errors, mo, pair_results, results):
-    notices = []
-    if fda_errors:
-        notices.append("FDA lookup warnings: " + "; ".join(fda_errors))
-    if len(pair_results) == 0:
-        notices.append(
-            "### Enter at least two distinct drug names"
+        _spl_ids = _openfda.get("spl_id", [])
+        if isinstance(_spl_ids, str):
+            _spl_ids = [_spl_ids]
+        if _spl_ids:
+            return f"spl:{_spl_ids[0]}"
+
+        return f"openfda:{_selected_name}:{_position}"
+
+    def _label_version_key(_label):
+        _effective_time = str(_label.get("effective_time", ""))
+        try:
+            _version = int(_label.get("version", 0) or 0)
+        except (TypeError, ValueError):
+            _version = 0
+        return _effective_time, _version
+
+    def _label_evidence_id(_label, _family_id):
+        _openfda = _label.get("openfda", {})
+        _spl_ids = _openfda.get("spl_id", [])
+        if isinstance(_spl_ids, str):
+            _spl_ids = [_spl_ids]
+        return str(_spl_ids[0]) if _spl_ids else _family_id
+
+    def _label_url(_evidence_id, _selected_name):
+        _query = (
+            f'openfda.spl_id:"{_evidence_id}"'
+            if _evidence_id and not _evidence_id.startswith("openfda:")
+            else f'openfda.generic_name:"{_selected_name}"'
         )
-    else:
-        notices.append(
-            f"### Pairwise evidence check ({len(entered)} drugs, {len(pair_results)} pairs)"
-        )
-        notices.append(pair_results)
-        notices.append(f"Optional non-FDA evidence file: `{evidence_path}`.")
-    mo.vstack([mo.md(item) if isinstance(item, str) else item for item in notices])
-    return
+        return f"{_base_url}?search={quote(_query, safe='')}&limit=1"
 
+    def _label_names(_label):
+        _openfda = _label.get("openfda", {})
+        _names = set()
+        for _field in ("brand_name", "generic_name", "substance_name"):
+            _values = _openfda.get(_field, [])
+            if isinstance(_values, str):
+                _values = [_values]
+            if isinstance(_values, list):
+                _names.update(
+                    _normalize_text(_value)
+                    for _value in _values
+                    if isinstance(_value, str) and _value.strip()
+                )
+        return _names
 
-@app.cell(hide_code=True)
-def _(mo, np, results):
-    if len(results) == 0:
-        score = 0.0
-        low, high = 0.0, 0.0
-    else:
-        # Draw from each pair's posterior and combine draws with a noisy-OR.
-        # This propagates uncertainty instead of multiplying fixed point values.
-        _rng = np.random.default_rng(123)
-        draws = np.column_stack([
-            _rng.beta(
-                1 + row.posterior_probability * 100,
-                1 + (1 - row.posterior_probability) * 100,
-                20_000,
+    def _retrieve_latest_label_families(_selected_name):
+        _families = {}
+        _errors = []
+        try:
+            for _field in ("openfda.brand_name", "openfda.generic_name"):
+                _response = requests.get(
+                    _base_url,
+                    params={"search": f'{_field}:"{_selected_name}"', "limit": 100},
+                    timeout=30,
+                )
+                if _response.status_code == 404:
+                    continue
+                _response.raise_for_status()
+                for _position, _label in enumerate(_response.json().get("results", [])):
+                    if _selected_name not in _label_names(_label):
+                        continue
+                    _family_id = _label_family_id(
+                        _label,
+                        _selected_name,
+                        _position,
+                    )
+                    _existing = _families.get(_family_id)
+                    if (
+                        _existing is None
+                        or _label_version_key(_label) > _label_version_key(_existing)
+                    ):
+                        _families[_family_id] = _label
+        except requests.RequestException as _exc:
+            _status = (
+                _exc.response.status_code
+                if _exc.response is not None
+                else "connection failed"
             )
-            for row in results.itertuples()
-        ])
-        combined = 1 - np.prod(1 - draws, axis=1)
-        score = float(np.mean(combined))
-        low, high = np.quantile(combined, [0.025, 0.975])
+            _errors.append(f"{_selected_name}: openFDA HTTP {_status}")
+        except ValueError:
+            _errors.append(f"{_selected_name}: invalid JSON response from openFDA")
+        return _families, _errors
 
-    mo.md(
-        f"## Bayesian combined harm probability: **{score:.1%}** "
-        f"(95% credible interval: {low:.1%}–{high:.1%})"
+    def _interaction_excerpt(_section, _other_name):
+        _normalized = " ".join(str(_section).split())
+        for _sentence in re.split(r"(?<=[.!?])\s+", _normalized):
+            if re.search(
+                rf"(?<![A-Za-z0-9]){re.escape(_other_name)}(?![A-Za-z0-9])",
+                _sentence,
+                re.IGNORECASE,
+            ):
+                return _sentence[:750].rstrip()
+        return None
+
+    def _excerpt_similarity_key(_excerpt):
+        _value = _normalize_text(_excerpt)
+        _value = re.sub(r"\bxanax\s+xr\b", "alprazolam", _value)
+        _value = re.sub(r"\bxanax\b", "alprazolam", _value)
+        _value = re.sub(r"\s*\[[^\]]*\]", "", _value)
+        _value = re.sub(r"\([^)]*\d[^)]*\)", "", _value)
+        _value = re.sub(r"[^a-z0-9 ]+", " ", _value)
+        return " ".join(_value.split())
+
+    def _deduplicate_excerpts(_excerpts):
+        _kept = []
+        _keys = []
+        for _excerpt in _excerpts:
+            _key = _excerpt_similarity_key(_excerpt)
+            _tokens = set(_key.split())
+            _is_duplicate = False
+            for _existing_key in _keys:
+                _existing_tokens = set(_existing_key.split())
+                _union = _tokens | _existing_tokens
+                _similarity = (
+                    len(_tokens & _existing_tokens) / len(_union)
+                    if _union
+                    else 1.0
+                )
+                if (
+                    _key == _existing_key
+                    or _key in _existing_key
+                    or _existing_key in _key
+                    or _similarity >= 0.82
+                ):
+                    _is_duplicate = True
+                    break
+            if not _is_duplicate:
+                _kept.append(_excerpt)
+                _keys.append(_key)
+        return _kept
+
+    _labels_by_drug = {}
+    fda_errors = []
+    for _selected_name in selected_drugs:
+        _selected_families, _selected_errors = _retrieve_latest_label_families(
+            _selected_name
+        )
+        _labels_by_drug[_selected_name] = _selected_families
+        fda_errors.extend(_selected_errors)
+
+    single_drug_interactions = pd.DataFrame()
+    pair_results = pd.DataFrame()
+    bayesian_documentation_prevalence = np.nan
+    documentation_credible_low = np.nan
+    documentation_credible_high = np.nan
+    documented_pair_count = 0
+    total_pair_count = 0
+
+    if len(selected_drugs) == 1:
+        _single_name = selected_drugs[0]
+        _single_rows = []
+        for _family_id, _label in _labels_by_drug.get(_single_name, {}).items():
+            _evidence_id = _label_evidence_id(_label, _family_id)
+            _sections = [
+                " ".join(str(_section).split())
+                for _section in _label.get("drug_interactions", [])
+                if isinstance(_section, str) and _section.strip()
+            ]
+            if not _sections:
+                continue
+            _single_rows.append({
+                "drug": _single_name,
+                "label_family_id": _family_id,
+                "latest_spl_id": _evidence_id,
+                "effective_time": str(_label.get("effective_time", "")),
+                "interaction_sections": "\n\n".join(_sections),
+                "source_url": _label_url(_evidence_id, _single_name),
+            })
+        single_drug_interactions = pd.DataFrame(
+            _single_rows,
+            columns=[
+                "drug", "label_family_id", "latest_spl_id", "effective_time",
+                "interaction_sections", "source_url",
+            ],
+        )
+    else:
+        _pair_findings = []
+        _all_mention_count = 0
+        _all_nonmention_count = 0
+
+        for _drug_a, _drug_b in combinations(selected_drugs, 2):
+            _family_trials = []
+            _matched_excerpts = []
+
+            for _label_drug, _other_drug in (
+                (_drug_a, _drug_b),
+                (_drug_b, _drug_a),
+            ):
+                for _family_id, _label in _labels_by_drug.get(
+                    _label_drug,
+                    {},
+                ).items():
+                    _evidence_id = _label_evidence_id(_label, _family_id)
+                    _matched_excerpt = None
+                    for _section in _label.get("drug_interactions", []):
+                        _matched_excerpt = _interaction_excerpt(
+                            _section,
+                            _other_drug,
+                        )
+                        if _matched_excerpt is not None:
+                            break
+
+                    _mentioned = _matched_excerpt is not None
+                    _family_trials.append({
+                        "label_drug": _label_drug,
+                        "family_id": _family_id,
+                        "evidence_id": _evidence_id,
+                        "mentioned": _mentioned,
+                        "url": _label_url(_evidence_id, _label_drug),
+                    })
+                    if _mentioned:
+                        _matched_excerpts.append(_matched_excerpt)
+
+            _trial_count = len(_family_trials)
+            _mention_count = sum(
+                _trial["mentioned"]
+                for _trial in _family_trials
+            )
+            _nonmention_count = _trial_count - _mention_count
+            _all_mention_count += _mention_count
+            _all_nonmention_count += _nonmention_count
+
+            _positive_trials = [
+                _trial
+                for _trial in _family_trials
+                if _trial["mentioned"]
+            ]
+            _evidence_ids = sorted({
+                _trial["evidence_id"]
+                for _trial in _positive_trials
+            })
+            _family_ids = sorted({
+                _trial["family_id"]
+                for _trial in _positive_trials
+            })
+            _label_directions = sorted({
+                _trial["label_drug"]
+                for _trial in _positive_trials
+            })
+            _source_urls = sorted({
+                _trial["url"]
+                for _trial in _positive_trials
+            })
+            _display_excerpts = _deduplicate_excerpts(_matched_excerpts)
+
+            if _trial_count == 0:
+                _posterior_mean = np.nan
+                _credible_low = np.nan
+                _credible_high = np.nan
+                _rating = "Not estimable: no matching label families retrieved"
+                _flag = "No labels retrieved"
+            elif _mention_count == 0:
+                _posterior_mean = np.nan
+                _credible_low = np.nan
+                _credible_high = np.nan
+                _rating = "No explicit co-mention found"
+                _flag = (
+                    "Not estimated: the posterior would be determined entirely "
+                    "by the prior. Absence of a label mention is not evidence of safety."
+                )
+            else:
+                _alpha = _prior_alpha + _mention_count
+                _beta = _prior_beta + _nonmention_count
+                _draws = _rng.beta(
+                    _alpha,
+                    _beta,
+                    _posterior_draw_count,
+                )
+                _posterior_mean = _alpha / (_alpha + _beta)
+                _credible_low, _credible_high = np.quantile(
+                    _draws,
+                    [0.025, 0.975],
+                )
+                _flag = "Bayesian estimate based on explicit label-family mentions"
+                if {_drug_a, _drug_b}.issubset(_label_directions):
+                    _rating = "Bidirectional label-family documentation"
+                elif _mention_count >= 2:
+                    _rating = "Repeated label-family documentation"
+                else:
+                    _rating = "Single label-family documentation"
+                documented_pair_count += 1
+
+            _pair_findings.append({
+                "drug_a": _drug_a,
+                "drug_b": _drug_b,
+                "documentation_probability": _posterior_mean,
+                "credible_low": _credible_low,
+                "credible_high": _credible_high,
+                "mentioning_label_families": _mention_count,
+                "retrieved_label_families": _trial_count,
+                "evidence_rating": _rating,
+                "interpretation_flag": _flag,
+                "label_directions": ", ".join(_label_directions),
+                "harm": "\n\n".join(_display_excerpts),
+                "label_family_ids": ", ".join(_family_ids),
+                "evidence_ids": ", ".join(_evidence_ids),
+                "source_url": _source_urls[0] if _source_urls else "",
+            })
+
+        pair_results = pd.DataFrame(
+            _pair_findings,
+            columns=[
+                "drug_a", "drug_b", "documentation_probability",
+                "credible_low", "credible_high", "mentioning_label_families",
+                "retrieved_label_families", "evidence_rating",
+                "interpretation_flag", "label_directions", "harm",
+                "label_family_ids", "evidence_ids", "source_url",
+            ],
+        )
+        total_pair_count = len(pair_results)
+
+        # The combination-level posterior uses all retrieved label-family trials.
+        # It estimates documentation prevalence, never clinical harm probability.
+        _all_trial_count = _all_mention_count + _all_nonmention_count
+        if _all_trial_count > 0 and _all_mention_count > 0:
+            _overall_alpha = _prior_alpha + _all_mention_count
+            _overall_beta = _prior_beta + _all_nonmention_count
+            _overall_draws = _rng.beta(
+                _overall_alpha,
+                _overall_beta,
+                _posterior_draw_count,
+            )
+            bayesian_documentation_prevalence = (
+                _overall_alpha / (_overall_alpha + _overall_beta)
+            )
+            (
+                documentation_credible_low,
+                documentation_credible_high,
+            ) = np.quantile(_overall_draws, [0.025, 0.975])
+
+    return (
+        bayesian_documentation_prevalence,
+        documentation_credible_high,
+        documentation_credible_low,
+        documented_pair_count,
+        fda_errors,
+        pair_results,
+        selected_drugs,
+        single_drug_interactions,
+        total_pair_count,
     )
 
-    return score
+
+@app.cell(hide_code=True)
+def _(
+    bayesian_documentation_prevalence,
+    documentation_credible_high,
+    documentation_credible_low,
+    documented_pair_count,
+    fda_errors,
+    mo,
+    np,
+    pair_results,
+    selected_drugs,
+    single_drug_interactions,
+    total_pair_count,
+):
+    _notices = []
+    if fda_errors:
+        _notices.append("FDA lookup warnings: " + "; ".join(fda_errors))
+
+    if len(selected_drugs) == 1:
+        _notices.append(
+            f"## Interaction sections for **{selected_drugs[0]}**"
+        )
+        _notices.append(
+            "Showing all `drug_interactions` sections from the latest retrieved "
+            "version of each distinct SPL label family. No probability is calculated "
+            "for a single drug."
+        )
+        if len(single_drug_interactions) == 0:
+            _notices.append("No interaction sections were retrieved.")
+        else:
+            _notices.append(single_drug_interactions)
+    else:
+        _raw_coverage = (
+            documented_pair_count / total_pair_count
+            if total_pair_count
+            else 0.0
+        )
+        _notices.append(
+            f"## Explicit pair documentation: **{documented_pair_count} of "
+            f"{total_pair_count} pairs** ({_raw_coverage:.0%})"
+        )
+        if np.isnan(bayesian_documentation_prevalence):
+            _notices.append(
+                "### Bayesian label-family documentation prevalence: **Not estimated**"
+            )
+        else:
+            _notices.append(
+                "### Bayesian label-family documentation prevalence: "
+                f"**{bayesian_documentation_prevalence:.1%}** "
+                f"(95% credible interval: {documentation_credible_low:.1%} "
+                f"to {documentation_credible_high:.1%})"
+            )
+        _notices.append(
+            "The Bayesian value estimates how often a comparable retrieved openFDA "
+            "label family explicitly documents the counterpart. It is not interaction "
+            "severity or patient harm probability. Rows with zero mentions are flagged "
+            "and show no Bayesian estimate because such a posterior would be driven "
+            "entirely by the prior."
+        )
+        _notices.append(
+            "Near-duplicate excerpts are consolidated for display. Evidence is counted "
+            "once per SPL label family using the latest retrieved version, while SPL IDs "
+            "remain available for traceability."
+        )
+        _notices.append(pair_results)
+
+    mo.vstack([
+        mo.md(_item) if isinstance(_item, str) else _item
+        for _item in _notices
+    ])
+    return
 
 
 if __name__ == "__main__":

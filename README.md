@@ -1,12 +1,12 @@
 # inteRx
 
-inteRx is a Marimo-based probabilistic drug-interaction explorer for research and education. It accepts generic or brand drug names, resolves label names through openFDA, checks every unique selected pair against FDA Structured Product Labeling (SPL) interaction text, and presents evidence-backed pairwise results with source links and uncertainty estimates.
+inteRx is a Marimo-based probabilistic drug-interaction documentation explorer for research and education. It accepts generic or brand drug names, resolves label names through openFDA, checks selected pairs against FDA Structured Product Labeling (SPL) interaction text, and presents auditable excerpts, source links, label-family counts, and Bayesian documentation-prevalence estimates.
 
 Hosted as a [molab-wasm-page](https://molab.marimo.io/github//fuzzyLife/inteRx/blob/master/app.py/wasm).
 
 ![inteRx interface](image.jpeg)
 
-> **Important:** inteRx is not a clinical decision-support tool. It must not be used to prescribe, stop, or change medication. A missing interaction result does not mean that a combination is safe.
+> **Important:** inteRx is not a clinical decision-support tool. It must not be used to prescribe, stop, or change medication. A missing interaction result does not mean that a combination is safe. The Bayesian results estimate openFDA label-family documentation prevalence, not clinical severity or patient harm probability.
 
 ## Run the app
 
@@ -32,9 +32,9 @@ The original comma-separated text box and later multiselect prototypes were repl
 3. The selected drug becomes a removable chip.
 4. The input clears and receives focus for the next drug.
 5. Duplicate selections are blocked.
-6. Select **Run interaction check** after choosing at least two distinct drugs.
+6. Select **Run interaction check** after choosing one or more drugs.
 
-The separate run button is intentional. It prevents the openFDA queries from running after every edit. The picker is not wrapped in a Marimo form because Marimo forms clone their wrapped element, while an `anywidget` instance cannot be deep-copied.
+The separate run button prevents openFDA queries from running after every edit. The picker is not wrapped in a Marimo form because Marimo forms clone the wrapped element, while an `anywidget` instance cannot be deep-copied.
 
 Examples available through the derived vocabulary include:
 
@@ -46,6 +46,25 @@ xanax
 xanax xr
 itraconazole
 ```
+
+### Single-drug mode
+
+When one drug is selected, inteRx retrieves every available `drug_interactions` section from the latest retrieved version of each distinct SPL label family for that drug. The output includes:
+
+```text
+drug
+label_family_id
+latest_spl_id
+effective_time
+interaction_sections
+source_url
+```
+
+No Bayesian probability is calculated in single-drug mode because no counterpart has been specified.
+
+### Multi-drug mode
+
+When two or more drugs are selected, inteRx generates every unique pair and checks both label directions. For example, an interaction may appear in the itraconazole label even when the corresponding warfarin label does not name itraconazole.
 
 ## What `app.py` does
 
@@ -62,52 +81,148 @@ openfda.brand_name
 openfda.generic_name
 ```
 
-Returned labels are filtered locally to retain labels whose normalized brand, generic, or substance names match the submitted name. This preserves familiar selections such as `xanax` while allowing interaction text to be matched through related ingredient names such as `alprazolam`.
+Returned labels are filtered locally to retain labels whose normalized brand, generic, or substance names match the submitted name. This preserves familiar selections such as `xanax` while connecting the label to related ingredient names such as `alprazolam`.
+
+### SPL label-family handling
+
+The app no longer treats every returned SPL record as independent evidence. It groups records by:
+
+```text
+openfda.spl_set_id
+```
+
+When `spl_set_id` is unavailable, the app falls back to the label-level `set_id`, then to an SPL identifier. Within each label family, the app keeps the latest retrieved version using:
+
+```text
+effective_time
+version
+```
+
+This reduces double-counting caused by multiple revisions of the same regulatory label family. The latest SPL identifier remains visible for traceability.
 
 ### Interaction evidence
 
-The app:
+For each pair, the app:
 
-- Generates every unique pair from the submitted drugs.
-- Reads the `drug_interactions` sections of matching labels.
-- Checks both directions for each pair because one drug's label may mention the other even when the reverse label does not.
-- Adds evidence only when the counterpart or a resolved label alias is explicitly named in the interaction text.
+- Reads the `drug_interactions` sections from the latest retrieved label in each distinct label family.
+- Checks both directions because one selected drug's label may mention the other even when the reverse label does not.
+- Counts one mention or non-mention trial per distinct label family.
+- Adds evidence only when the counterpart is explicitly named in the interaction text.
 - Extracts the matching sentence or excerpt into the `harm` column.
-- Keeps pairs without an explicit label co-mention and marks them as unknown rather than safe.
+- Retains pairs without an explicit co-mention and flags the absence as unknown rather than safe.
 - Adds an SPL-specific openFDA query URL in `source_url` for evidence-backed results.
-- Consolidates unique label excerpts and evidence into one result per drug pair.
+- Preserves label-family IDs and SPL evidence IDs for auditing.
+- Consolidates near-duplicate excerpts for display while keeping all supporting identifiers.
 
-The openFDA drug-label endpoint returns label records, not a validated pairwise interaction-checker result. inteRx performs the pair comparison locally.
+The openFDA drug-label endpoint returns regulatory label records, not a validated pairwise interaction-checker result. inteRx performs the pair comparison locally.
 
 See the [openFDA drug-label endpoint documentation](https://open.fda.gov/apis/drug/label/how-to-use-the-endpoint/) and [openFDA query parameter reference](https://open.fda.gov/apis/query-parameters/).
 
-## Bayesian scoring
+### Near-duplicate excerpt consolidation
 
-Each pair starts with a conservative `Beta(1, 9)` prior. Evidence rows update that prior using source and row weights. The app reports:
+Regulatory wording can be repeated across labels or closely related products, such as XANAX and XANAX XR. The app normalizes case, references, punctuation, brand variants, and spacing before comparing excerpts. Exact, contained, and highly overlapping excerpts are consolidated for display.
 
-- Posterior mean probability for each evidence-backed pair.
-- A 95% credible interval for each pair.
-- Evidence count, evidence identifiers, source type, and source URL.
+This display deduplication does not erase the underlying evidence trail. Label-family IDs and SPL IDs remain available in the result row.
 
-For combinations containing multiple evidence-backed pairs, the app samples from the pair-level posteriors and applies noisy-OR aggregation. This propagates pair-level uncertainty into the combined estimate instead of multiplying fixed point estimates.
+## Bayesian documentation model
 
-The source weights and prior are modeling defaults. They are not clinically validated probabilities.
+The original model used a `Beta(1, 9)` prior, arbitrary source weights, and noisy-OR aggregation. That approach was removed because openFDA label excerpts are not patient outcomes, source weights had no empirical calibration, and the resulting values could be mistaken for clinical harm probabilities.
 
-## Optional external evidence
+The current model asks a narrower question:
 
-The current app retains support for an optional reviewed evidence CSV through the `INTERACTION_EVIDENCE` environment variable. The expected columns are:
+> Among comparable retrieved openFDA label families for the selected pair, how prevalent is explicit documentation of the counterpart?
+
+### Observation unit
+
+Each latest distinct SPL label family is one Bernoulli documentation trial:
 
 ```text
-drug_a,drug_b,harm,source,evidence_id,positive,negative,weight,url
+Mention: the drug_interactions section explicitly names the counterpart.
+Non-mention: the retrieved label family does not explicitly name the counterpart.
 ```
 
-Example:
+The model uses a weak symmetric Jeffreys prior:
 
-```bash
-INTERACTION_EVIDENCE=/path/to/reviewed_evidence.csv uv run marimo run app.py
+```python
+prior_alpha = 0.5
+prior_beta = 0.5
 ```
 
-Only use evidence that you are authorized to access. Validate the evidence, terminology, and calibration before using it in any workflow.
+For `k` mentioning label families among `n` retrieved label families:
+
+```text
+posterior alpha = 0.5 + k
+posterior beta  = 0.5 + n - k
+```
+
+The pairwise posterior mean is:
+
+```text
+documentation probability = posterior alpha / (posterior alpha + posterior beta)
+```
+
+The app draws 20,000 samples from the posterior and reports a 95% credible interval.
+
+### Zero-mention handling
+
+When a pair has zero explicit mentions, the app does not display a prior-generated percentage or credible interval. Instead, the row shows:
+
+```text
+documentation_probability: Not estimated
+credible_low: Not estimated
+credible_high: Not estimated
+evidence_rating: No explicit co-mention found
+```
+
+The row also explains:
+
+> Not estimated: the posterior would be determined entirely by the prior. Absence of a label mention is not evidence of safety.
+
+This avoids presenting values such as 5% as though positive evidence existed when the number was generated solely by the prior.
+
+### Pairwise output
+
+Each pair includes:
+
+```text
+drug_a
+drug_b
+documentation_probability
+credible_low
+credible_high
+mentioning_label_families
+retrieved_label_families
+evidence_rating
+interpretation_flag
+label_directions
+harm
+label_family_ids
+evidence_ids
+source_url
+```
+
+Possible evidence ratings include:
+
+```text
+Not estimable: no matching label families retrieved
+No explicit co-mention found
+Single label-family documentation
+Repeated label-family documentation
+Bidirectional label-family documentation
+```
+
+### Combination summary
+
+For multi-drug selections, the app reports two separate summaries:
+
+```text
+Explicit pair documentation: X of Y selected pairs
+Bayesian label-family documentation prevalence with a 95% credible interval
+```
+
+The explicit-pair value is a direct coverage count. The Bayesian prevalence pools the distinct label-family mention and non-mention observations across all selected pairs under the Jeffreys prior.
+
+Neither value is a probability of patient harm, interaction severity, causality, or clinical outcome. The evidence excerpt and regulatory action language remain more important than the numerical documentation estimate.
 
 ## Building the drug vocabulary
 
@@ -130,7 +245,7 @@ The builder:
 - Rejects placeholders, strengths, dosage forms, unsupported punctuation, combination strings, formulation descriptions, and selected biologic suffix variants.
 - Collects usable brand names and links each brand to clean canonical candidates found on the same label.
 
-This allows `aspirin` to be discovered from openFDA data without manually inserting it.
+This allows `aspirin` to be discovered from openFDA data without manually inserting the name.
 
 #### Pass 2: scan interaction text
 
@@ -139,7 +254,7 @@ The builder then:
 - Scans all available `drug_interactions` sections.
 - Retains canonical candidates that are explicitly mentioned in interaction text.
 - Counts total mentions and distinct labels containing each mention.
-- Retains a brand only when its label relationship connects it to a retained canonical interaction name.
+- Retains a brand only when the label relationship connects the brand to a retained canonical interaction name.
 
 For example, `xanax` is retained as a derived brand alias connected to `alprazolam`. Neither `aspirin` nor `xanax` is manually added to the final list.
 
@@ -184,7 +299,7 @@ openfda_drug_choices = (
 )
 ```
 
-The builder uses Python's AST to locate that assignment and replaces only the tuple. It then parses and compiles the updated source before atomically replacing `app.py` through a temporary file.
+The builder uses Python's AST to locate that assignment and replaces only the tuple. The builder then parses and compiles the updated source before atomically replacing `app.py` through a temporary file.
 
 By default, the builder updates `app.py` in the current directory. To update another file:
 
@@ -218,17 +333,25 @@ A missing required entity stops the build so a regression cannot silently remove
 
 ## Limitations
 
+- The Bayesian values estimate openFDA label-family documentation prevalence, not patient harm probability.
 - Label co-mention does not establish causality, severity, dose dependence, or patient-specific risk.
-- A label may use an ingredient, class, abbreviation, salt, or synonym that is not captured by the available aliases.
+- Non-mention is used as a documentation trial, but regulatory labels are not independent random samples and may differ by product, manufacturer, indication, formulation, and revision history.
+- Grouping by `spl_set_id` reduces revision duplication but does not make different label families statistically independent.
+- Only the latest retrieved label version in each family is used, so historical wording is not modeled.
+- A label may use an ingredient, class, abbreviation, salt, or synonym that is not captured by literal matching.
+- Near-duplicate excerpt consolidation is heuristic and affects display only.
 - A missing label co-mention does not mean the combination is safe.
+- The openFDA API query limit and matching strategy may not retrieve every relevant label family.
 - openFDA data may be incomplete, duplicated, delayed, or inconsistently normalized.
 - The generated vocabulary is designed for interaction-text discovery, not as a complete drug terminology or prescribing database.
-- The Bayesian prior, evidence weights, and noisy-OR aggregation are exploratory defaults rather than validated clinical calibration.
+- The Jeffreys prior and pooled label-family model are exploratory and have not been clinically calibrated.
 - FDA and openFDA advise against relying on openFDA data alone for medical-care decisions.
 
 ## Demo
 
-A 1:46 public demo video explains the evidence pipeline, Bayesian aggregation, the earlier Codex implementation work, and GPT-5.6 Luna Light's role in the project: [watch on YouTube](https://www.youtube.com/watch?v=a0pYnpxZgTw).
+A 1:46 public demo video explains the earlier evidence pipeline, Bayesian aggregation, Codex implementation work, and GPT-5.6 Luna Light's role in the project: [watch on YouTube](https://www.youtube.com/watch?v=a0pYnpxZgTw).
+
+> The demo predates the current label-family documentation model and may show the retired weighted harm-probability and noisy-OR calculations.
 
 ## Credits and development history
 
@@ -246,7 +369,7 @@ Earlier development was carried out with Codex and GPT-5.6 Luna Light. Codex imp
 | Merge multiple rows for the same pair. | Consolidated unique label excerpts and evidence into one table row and one posterior per drug pair. |
 | Update the README. | Replaced the prototype notes with current setup, architecture, source, scoring, limitations, demo, and attribution documentation. |
 
-GPT-5.6 reasoning model, assisted with the work documented in this update. That work included diagnosing vocabulary omissions, identifying why `aspirin` was excluded, restoring brand-name choices such as `xanax`, designing and validating the token-style autocomplete interaction, separating selection from query execution, resolving the Marimo `anywidget` form cloning failure, building the two-pass vocabulary derivation workflow, adding AST-based automatic embedding into `app.py`, and updating this README. The project owner tested the application locally and directed each design correction.
+GPT-5.6 reasoning model, assisted with the subsequent work documented in this further update. The work included diagnosing vocabulary omissions, identifying why `aspirin` was excluded, restoring brand-name choices such as `xanax`, designing and validating the token-style autocomplete interaction, separating selection from query execution, resolving the Marimo `anywidget` form cloning failure, building the two-pass vocabulary derivation workflow, adding AST-based automatic embedding into `app.py`, replacing the weighted harm-probability model with a label-family documentation model, suppressing prior-only zero-mention estimates, grouping evidence by SPL label family, selecting the latest label version, consolidating near-duplicate excerpts, adding single-drug interaction retrieval, and updating this README. The project owner tested the application locally and directed each design correction.
 
 The project owner selected the data source, product scope, interaction examples, hosting constraints, and final design decisions.
 
@@ -260,12 +383,20 @@ The project owner selected the data source, product scope, interaction examples,
 - Removed the attempted `.form()` wrapper after Marimo raised `NotImplementedError: Widgets cannot be copied`; `mo.ui.run_button` now gates execution without cloning the widget.
 - Embedded the autocomplete vocabulary directly in `app.py` for WASM deployment.
 - Restored generic and brand-name openFDA lookup and label-alias matching.
-- Added bidirectional pair inspection and retained visible interaction excerpts, evidence identifiers, source URLs, pair probabilities, and credible intervals.
+- Added bidirectional pair inspection and retained visible interaction excerpts, evidence identifiers, source URLs, posterior estimates, and credible intervals.
 - Investigated missing `aspirin` and found that collecting candidates only from labels with interaction sections was too restrictive.
 - Reworked vocabulary generation to collect generic and substance candidates from all labels, then retain candidates mentioned in interaction text.
 - Derived brand aliases from label relationships, including `xanax -> alprazolam`.
 - Added auditable generated outputs and required regression checks for aspirin, warfarin, alprazolam, and Xanax.
 - Added AST-based replacement of the embedded `openfda_drug_choices` tuple in `app.py`.
+- Removed the arbitrary openFDA source weight, `Beta(1, 9)` harm prior, and noisy-OR harm aggregation.
+- Reframed Bayesian output as label-family documentation prevalence using a Jeffreys `Beta(0.5, 0.5)` prior.
+- Grouped evidence by `spl_set_id` and retained the latest retrieved label version per family.
+- Stopped reporting posterior values for zero-mention pairs because the estimate would be determined entirely by the prior.
+- Added an interpretation flag that states absence of a label mention is not evidence of safety.
+- Consolidated near-duplicate XANAX and XANAX XR excerpts for display without removing the evidence trail.
+- Added single-drug mode to retrieve all interaction sections from the latest retrieved label in each distinct SPL family.
+- Separated direct pair coverage from the pooled Bayesian label-family documentation-prevalence estimate.
 
 ## License and responsibility
 
